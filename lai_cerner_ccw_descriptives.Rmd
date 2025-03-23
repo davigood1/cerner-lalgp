@@ -1,0 +1,289 @@
+```{r}
+library(pacman)
+p_load(tidyverse, tidylog, survival, survminer, boot, RColorBrewer, gtsummary, future, furrr, flextable, officer)
+p_load_gh("Genentech/survivalCCW")
+
+# Define the JAMA color palette (e.g., 2 colors for the strata)
+jama_colors <- brewer.pal(2, "Set1")
+
+p_load(flextable, officer)
+p_load_gh("zheer-kejlberg/Z.gtsummary.addons")
+
+options(scipen=999)
+```
+
+```{r}
+#Load data
+df.ccw <- read_rds("df_ccw.rds")
+```
+
+```{r}
+df.ccw %>%
+  select(pwud, laLGP) %>%
+  tbl_summary(by = pwud)
+
+df.ccw %>%
+  select(pwud, laLGP) %>%
+  tbl_summary(by = laLGP)
+
+df.ccw %>%
+  select(pwud, laLGP,
+         Osteomyelitis, Endocarditis, Bacteremia, separthritis) %>%
+  tbl_summary(by = laLGP)
+```
+
+
+```{r}
+df.table.1 <- df.ccw %>%
+    select(
+         `Age, years` = age,
+        Gender = gender,
+        Race = race,
+        Ethnicity = ethnicity,
+        Insurance = insurance,
+        `Alcohol abuse` = alcohol,
+        `Blood loss anemia` = bloss,
+        `Chronic peptic ulcer disease` = pud,
+        `Chronic pulmonary disease` = copd,
+        `Coagulation deficiency` = coag,
+        `Congestive heart failure` = chf,
+        `Deficiency anemias` = anem,
+        `Depression` = dep,
+        `Diabetes with chronic complications` = diabeteswcomp,
+        `Diabetes without chronic complications` = diabeteswocopm,
+        `Fluid and electrolyte disorders` = fluid,
+        `HIV and AIDS` = hiv,
+        `Hypertension, complicated` = hypert,
+        `Hypertension, uncomplicated` = hypertun,
+        `Hypothyroidism` = hypothy,
+        `Liver disease` = liver,
+        `Lymphoma` = lymph,
+        `Metastatic cancer` = cancmeta,
+        `Obesity` = obe,
+        `Other neurological disorders` = neuro,
+        `Paralysis` = para,
+        `Peripheral vascular disease` = pvd,
+        `Psychoses` = psycho,
+        `Pulmonary circulation disorders` = pcd,
+        `Renal failure` = rf,
+        `Rheumatoid arthritis/collagen vascular diseases` = collavd,
+        `Solid tumor without metastasis` = cancwometa,
+        `Valvular disease` = valve,
+        `Weight loss` = weight,
+        `History of opioid use or disorder` = oud,
+        `History of cocaine use or disorder` = cud,
+        `History of methamphetamine use or disorder` = mud,
+        `Injection drug use` = idu,
+        MOUD,
+        `Any SUD or drug use` = pwud,
+        `Bed size` = bed_size,
+        `One digit zip code` = zip_code,
+        `Bacteremia, isolated` = Bacteremia,
+        Osteomyelitis = Osteomyelitis, 
+        `Septic arthritis` = separthritis,
+        Endocarditis = Endocarditis,
+        `Length of stay, index admission` = los_index,
+        `Long acting glycopeptide (yes/no)` = laLGP
+        )
+
+
+```
+
+```{r}
+#Display table 1 using gtsummary for PWUD
+tbl.1.pwud <- df.table.1 %>% 
+    filter(`Any SUD or drug use` == "Yes") %>%
+    select(-c(`Any SUD or drug use`)) %>%
+    tbl_summary(by = `Long acting glycopeptide (yes/no)`,
+               sort = list(all_categorical() ~ "frequency"),
+               statistic = list(all_continuous() ~ "{mean} ({sd})")) %>%
+    add_p(test = list(#all_categorical() ~ "fisher.test.simulate.p.values",
+                     all_continuous() ~ "t.test")) %>%
+  add_overall() %>%
+    modify_caption("Table 1. Patient characteristics for PWUD") %>%
+    bold_labels() #%>% 
+#    add_overall()
+               
+
+tbl.1.pwud
+```
+```{r}
+#Display table 1 using gtsummary for PWUD
+tbl.1.non.pwud <- df.table.1 %>% 
+    filter(`Any SUD or drug use` == "No") %>%
+    select(-c(`History of opioid use or disorder`,
+        `History of cocaine use or disorder`,
+        `History of methamphetamine use or disorder`,
+        `Injection drug use`,
+        `Any SUD or drug use`,
+        MOUD)) %>%
+    tbl_summary(by = `Long acting glycopeptide (yes/no)`,
+               sort = list(all_categorical() ~ "frequency"),
+               statistic = list(all_continuous() ~ "{mean} ({sd})")) %>%
+  add_overall() %>%
+    add_SMD() %>%
+    modify_caption("Table 1. Patient characteristics for PWUD") %>%
+    bold_labels() #%>% 
+#    add_overall()
+               
+
+tbl.1.non.pwud
+```
+
+```{r}
+#Merge tables
+tbl.1.merged <- tbl_merge(
+    tbls = list(tbl.1.pwud , tbl.1.non.pwud ),
+    tab_spanner = c("**PWUD**", "**non-PWUD**")
+  ) %>%
+    modify_caption("Table 1. Patient characteristics by receipt of long acting glycopeptide")
+
+tbl.1.merged 
+```
+
+```{r}
+dir.create("~/results", showWarnings = FALSE, recursive = TRUE)
+
+# Convert gtsummary table to a flextable
+tbl.1.docx <- tbl.1.merged %>% 
+  as_flex_table()
+
+# Save as a Word document
+doc <- read_docx() %>% 
+  body_add_flextable(tbl.1.docx) %>% 
+  body_add_par("")  # Adds a blank line for spacing
+
+print(doc, target = paste0("results/table_1_", Sys.Date(), ".docx"))
+```
+
+```{r}
+df.outcomes <- df.ccw %>%
+    select(
+        personid,
+        `Long acting glycopeptide (yes/no)`,
+        `Any SUD or drug use` = pwud,
+        `Follow-up time, days` = censure_time,
+        `Length of stay, index admission` = los_index,  # Add the missing backtick here
+        Discharge = discharge_disposition,
+        #`Readmission, 30 days` = readmissions_30d, 
+        `Readmission, 90 days` = readmissions_90d,         
+        #`Readmission, 365 days` = readmissions_365d, 
+        #`Number of readmission, 365 days` = num_readmissions_365d, 
+        #`ED visit, 30 days` = edvisit_30d, 
+        `ED visit, 90 days` = edvisit_90d,         
+        #`ED visit, 365 days` = edvisit_365d, 
+        #`Number of ED visits, 365 days` = num_edvisits_365d, 
+        #`Reinfection, 30 days` = reinfection_30d,
+        #`Reinfection, 90 days` = reinfection_90d,
+        #`Reinfection, 365 days` = reinfection_365d,
+        #`Hospice, 30 days` = hospice_30d,
+        #`Hospice, 90 days` = hospice_90d,
+        #`Hospice, 365 days` = hospice_365d,
+        #`Death, 30 days` = death_30d,
+        #`Death, 90 days` = death_90d,   
+        #`Death, 365 days` = death_365d,
+        #`Death or hospice, 30 days` = death_or_hospice_30d,
+        `Death or hospice, 90 days` = death_or_hospice_90d,   
+        #`Death or hospice, 365 days` = death_or_hospice_365d,
+        `Composite: Readmission, ED visit, or death/hospice, 90 days` = composite
+    ) %>%
+    mutate(
+        retention_90_days = if_else(
+            `Follow-up time, days` >= 90 | 
+            `Readmission, 90 days` == 1 | 
+            `ED visit, 90 days` == 1 | 
+            `Death or hospice, 90 days` == 1, 
+            1, 0
+        )
+    ) %>%
+    mutate(
+        loss_to_follow_up_90_days = if_else(
+            `Follow-up time, days` < 90 & 
+            `Readmission, 90 days` == 0 & 
+            `ED visit, 90 days` == 0 & 
+            `Death or hospice, 90 days` == 0, 
+            1,  # Mark as lost to follow-up
+            0   # Not lost to follow-up
+        )
+    )
+
+```
+
+
+
+```{r}
+#Outcomes table for PWUD
+tbl.outcomes.pwud <- df.outcomes %>%
+    filter(`Any SUD or drug use` == "Yes") %>% 
+    select(-personid, -`Any SUD or drug use`) %>%
+    tbl_summary(by = `Long acting glycopeptide (yes/no)`,
+                sort = all_categorical() ~ "frequency",
+               statistic = list(all_continuous() ~ "{mean} ({sd})")) %>%
+    add_p() %>%
+    modify_caption("Table outcomes by glycopeptides use / pwud") %>%
+    bold_labels() %>% 
+    add_overall()
+
+tbl.outcomes.pwud
+```
+
+```{r}
+#Outcomes table for non-PWUD
+tbl.outcomes.non.pwud <- df.outcomes %>%
+    filter(`Any SUD or drug use` == "No") %>% 
+    select(-personid, -`Any SUD or drug use`) %>%
+    tbl_summary(by = `Long acting glycopeptide (yes/no)`,
+                sort = all_categorical() ~ "frequency",
+               statistic = list(all_continuous() ~ "{mean} ({sd})")) %>%
+    add_p() %>%
+    modify_caption("Table outcomes by glycopeptides use / non-pwud") %>%
+    bold_labels() %>% 
+    add_overall()
+
+tbl.outcomes.non.pwud
+```
+
+
+```{r}
+tbl.outcomes <- df.ccw %>%
+  select(
+    laLGP, pwud,
+    `Readmission, 90 days` = "readmissions_90d", 
+    `ER visit, 90 days` = "edvisit_90d", 
+    `Death or hospice, 90 days` = "death_or_hospice_90d", 
+    `Composite: Readmission, ER visit, or death/hospice, 90 days` = composite, 
+    `Length of stay` = los_index, 
+    `Discharge disposition` = discharge_disposition
+  ) %>%
+  tbl_strata(
+    strata = pwud,  # Stratify by pwud first
+    .tbl_fun = ~ tbl_summary(., by = laLGP) %>% add_overall() %>% add_p()  # Add overall column
+  ) 
+  
+tbl.outcomes
+
+
+
+# Convert to flextable with autofit and landscape formatting
+tbl.outcomes <- tbl.outcomes %>% 
+  as_flex_table() %>%
+  autofit()
+# Save as a Word document
+doc <- read_docx() %>% 
+  body_add_flextable(tbl.outcomes) %>% 
+  body_add_par("")  # Adds a blank line for spacing
+
+print(doc, target = paste0("results/table_outcomes_", Sys.Date(), ".docx"))
+```
+
+```{r}
+df.ccw %>%
+  select(pwud, antibiotics, laLGP) %>%
+  filter(laLGP == 0) %>%
+  tbl_strata(
+    strata = pwud,  # Stratify by pwud first
+    .tbl_fun = ~ tbl_summary(., sort = all_categorical() ~ "frequency")
+  ) %>%
+  as_flex_table()
+  
+```

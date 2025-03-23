@@ -1,0 +1,529 @@
+```{r}
+library(pacman)
+p_load(tidyverse, tidylog, survival, survminer, boot, RColorBrewer, gtsummary, future, furrr, gt)
+p_load_gh("Genentech/survivalCCW")
+
+# Define the JAMA color palette (e.g., 2 colors for the strata)
+jama_colors <- brewer.pal(2, "Set1")
+
+extract_results <- function(group_name, boot_results) {
+  boot_results %>%
+    bind_rows() %>%
+    summarise(
+      HR = mean(hr.clone, na.rm = TRUE),
+      `95% CI (HR)` = paste0(
+        quantile(hr.clone, 0.025, na.rm = TRUE), " - ", 
+        quantile(hr.clone, 0.975, na.rm = TRUE)
+      ),
+      RMST_Diff_90d = mean(rmst_diff.rmean, na.rm = TRUE),
+      `95% CI (RMST)` = paste0(
+        quantile(rmst_diff.rmean, 0.025, na.rm = TRUE), " - ", 
+        quantile(rmst_diff.rmean, 0.975, na.rm = TRUE)
+      )
+    ) %>%
+    mutate(Group = group_name) %>%
+    relocate(Group)
+}
+
+```
+
+```{r}
+#Load data
+df.ccw <- read_rds("df_ccw.rds")
+
+
+df.ccw <- df.ccw %>%
+  mutate(gender = replace_na(gender, "Male"))
+
+
+#Create dummy variables for categorical indicators
+p_load(fastDummies)
+df.ccw <- df.ccw %>%
+  mutate(across(c(gender, race, ethnicity, insurance, MOUD, zip_code, bed_size), 
+                ~ gsub(" ", "_", as.character(.)))) %>%
+  mutate(across(c(zip_code, bed_size), 
+                ~ gsub("-", "", as.character(.)))) %>%
+  mutate(across(c(zip_code, bed_size), 
+                ~ gsub(",", "", as.character(.)))) %>%
+  mutate(across(c(bed_size), 
+                ~ gsub("<", "", as.character(.)))) %>%
+  dummy_cols(
+    select_columns = c("gender", "race", "ethnicity", "insurance", "MOUD", "zip_code", "bed_size", "discharge_disposition"), 
+    remove_most_frequent_dummy = TRUE,   # Avoids multicollinearity
+    remove_selected_columns = TRUE,
+    ignore_na = T)  # Removes original categorical columns
+
+df.ccw <- df.ccw %>%
+  mutate(across(starts_with("zip_code"), ~ replace_na(., 0)))
+```
+
+### PWUD
+
+```{r Clones/weights}
+# Define list of predictor variables
+predvars_list_pwud <- c(
+  "age", "alcohol", "bloss", "pud", "copd", "coag", "chf", "anem", "dep", 
+  "diabeteswcomp", "diabeteswocopm", "fluid", "hiv", "hypert", "hypertun", 
+  "hypothy", "liver", "lymph", "cancmeta", "obe", "neuro", "para", "pvd", 
+  "psycho", "pcd", "rf", "collavd", "cancwometa", "valve", "weight", "oud", 
+  "cud", "mud", "idu", 
+  "MOUD_Buprenorphine", "MOUD_Methadone",
+  "Bacteremia", "Osteomyelitis", "separthritis", 
+  "Endocarditis", "gender_Female", "race_Black_or_African_American", 
+  "race_Other_race", "race_Unknown", "ethnicity_Hispanic_or_Latino", 
+  "ethnicity_Unknown", "insurance_Commerical_insurance", "insurance_Medicaid", 
+  "insurance_Other", "insurance_Unknown",
+  "bed_size_500", "bed_size_500999",
+  "zip_code_0__Connecticut_Massachusetts_Maine_New_Hampshire_New_Jersey_Puerto_Rico_Rhode_Island", 
+  "zip_code_1__Delaware_New_York_Pennsylvania", "zip_code_2__District_of_Columbia_Maryland_North_Carolina_South_Carolina_Virginia_West_Virginia", 
+  "zip_code_3__Alabama_Florida_Georgia_Mississippi_Tennessee", 
+  "zip_code_4__Indiana_Kentucky_Michigan_Ohio", "zip_code_5__Iowa_Minnesota_Montana_North_Dakota_South_Dakota_Wisconsin", 
+  "zip_code_6__Illinois_Kansas_Missouri_Nebraska", "zip_code_7__Arkansas_Louisiana_Oklahoma_Texas", 
+  "zip_code_9__Alaska_California_Hawaii_Oregon_Washington"
+)
+```
+
+```{r}
+
+#Create clones
+df.clones.pwud <- df.ccw %>% 
+  filter(pwud == "Yes") %>%
+  create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+  ) 
+
+str(df.clones.pwud)
+
+#plot_censoring_over_time(df.clones.pwud)
+
+#Create weights
+df.clones.pwud <- df.clones.pwud %>%
+  cast_clones_to_long() %>% 
+  generate_ccw(predvars = predvars_list_pwud)
+```
+
+```{r}
+#Cox model
+m.cox.pwud <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df.clones.pwud, weights = weight_cox)
+
+m.cox.pwud %>% tbl_regression(exponentiate = T)
+
+# Kaplan-Meier estimate for each clone group using counting process data
+km_fit.ccw.pwud <- survfit(Surv(t_start, t_stop, outcome) ~ clone, 
+                  data = df.clones.pwud)
+
+# Plot Kaplan-Meier curve
+ggsurvplot(km_fit.ccw.pwud, 
+           data = df.clones.pwud, 
+           conf.int = FALSE,             # Do not show confidence intervals
+           pval = FALSE,                 # Do not show p-value
+           risk.table = FALSE,           # Do not show risk table
+           risk.table.col = "strata",    # Color by strata
+           ggtheme = theme_minimal(),    # Use minimal theme
+           legend.title = "Study arm",   # Legend title
+           legend.labs = c("SOC", "laLGP"),  # Legend labels
+           xlim = c(0, max(df.clones.pwud$t_stop)),  # Set x-axis limit (can adjust as needed)
+           break.time.by = 30,           # Set 30-day intervals for ticks
+           palette = jama_colors)  +       # Use JAMA color palette
+  labs(title = "PWUD - CCW analysis")
+
+#NAIVE
+# Kaplan-Meier estimate for each clone group using counting process data
+km_fit.naive.pwud <- survfit(Surv(composite_days, composite) ~ laLGP, 
+                  data = df.ccw %>% filter(pwud == "Yes"))
+
+# Plot Kaplan-Meier curve
+ggsurvplot(km_fit.naive.pwud, 
+           data = df.ccw %>% filter(pwud == "Yes"), 
+           conf.int = FALSE,             # Do not show confidence intervals
+           pval = FALSE,                 # Do not show p-value
+           risk.table = FALSE,           # Do not show risk table
+           risk.table.col = "strata",    # Color by strata
+           ggtheme = theme_minimal(),    # Use minimal theme
+           legend.title = "Study arm",   # Legend title
+           legend.labs = c("SOC", "laLGP"),  # Legend labels
+           xlim = c(0, max(df.clones.pwud$t_stop)),  # Set x-axis limit (can adjust as needed)
+           break.time.by = 30,           # Set 30-day intervals for ticks
+           palette = jama_colors) +       # Use JAMA color palette
+  labs(title = "PWUD - Naive analysis")
+```
+
+```{r Bootstrapping}
+boot_cox <- function(data, indices) {
+  
+  # Make long data.frame with weights
+  ccw_df <- data[indices, ] |>
+    create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+    ) |>
+    cast_clones_to_long() |>
+  generate_ccw(predvars = predvars_list_pwud) %>%
+  winsorize_ccw_weights(quantiles = c(0.01, 0.99))
+    
+  # Extract HR from CoxPH
+  cox_ccw <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = ccw_df, weights = weight_cox) 
+   
+  hr <- cox_ccw |>
+    coef() |>
+    exp()
+
+  out <- c("hr" = hr)
+
+  # Create survfit objects for each of treated and untreated
+  surv_1 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 1, ], weights = weight_cox)
+  surv_0 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 0, ], weights = weight_cox)
+
+  # RMST difference (Restricted Mean Survival Time over 90 days)
+  rmst_1 <- surv_1 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+  
+  rmst_0 <- surv_0 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+
+  rmst_diff <- rmst_1 - rmst_0
+
+  out <- c(out, "rmst_diff" = rmst_diff)
+
+  # 90-day survival difference
+  index_90d_1 <- which.min(abs(surv_1$time - 90))
+  index_90d_0 <- which.min(abs(surv_0$time - 90))
+
+  # Get the 90-day survival probabilities
+  surv_1_90d <- surv_1$surv[index_90d_1]
+  surv_0_90d <- surv_0$surv[index_90d_0]
+
+  surv_diff_90d <- surv_1_90d - surv_0_90d
+
+  out <- c(out, "surv_diff_90d" = surv_diff_90d)
+
+}
+```
+
+```{r}
+# Set up parallel plan with 10 workers
+plan(multisession, workers = 10)
+
+# Run boot_cox for overall PWUD group only
+boot_results_pwud <- future_map_dfr(1:500, ~{
+  safely_run <- safely(function() {
+    resample_index <- sample(nrow(df.ccw %>% filter(pwud == "Yes")), replace = TRUE)
+    boot_sample <- df.ccw %>% filter(pwud == "Yes") %>% slice(resample_index)
+    boot_cox(boot_sample)
+  })
+  
+  result <- safely_run()
+  if (is.null(result$error)) {
+    return(result$result)
+  } else {
+    message("Error in iteration: ", result$error)
+    return(NULL)
+  }
+}, .progress = TRUE, .options = furrr_options(seed = 1))
+
+plan(sequential)
+
+# Create results table for PWUD
+overall_results_pwud <- extract_results("PWUD Overall", boot_results_pwud)
+
+# Print table using gt
+final_table <- gt(overall_results_pwud) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 2)
+
+final_table
+
+# Save the table as a Word document
+gtsave(final_table, "laLGP_Effect_Results_pwud_main_standardized.docx")
+
+
+```
+
+#Non PWUD
+
+```{r}
+predvars_list_non_pwud <- c(
+  "age", 
+  "gender_Female", 
+  "race_Black_or_African_American", 
+  "race_Other_race", 
+  "ethnicity_Hispanic_or_Latino",
+  "ethnicity_Unknown",
+  "insurance_Commerical_insurance", 
+  "insurance_Medicaid", 
+  "insurance_Other", 
+  "insurance_Unknown", 
+  "alcohol", "bloss", "pud", "copd", "coag", "chf", "anem", "dep", 
+  "diabeteswcomp", "diabeteswocopm", "fluid", "hiv", "hypert", "hypertun", 
+  "hypothy", "liver", "lymph", "cancmeta", "obe", "neuro", "para", "pvd", 
+  "psycho", "pcd", "rf", "collavd", "cancwometa", "valve", "weight", 
+  "Bacteremia", 
+  "Osteomyelitis", 
+  "separthritis", 
+  "Endocarditis", 
+  "zip_code_0__Connecticut_Massachusetts_Maine_New_Hampshire_New_Jersey_Puerto_Rico_Rhode_Island", 
+  "zip_code_1__Delaware_New_York_Pennsylvania", "zip_code_2__District_of_Columbia_Maryland_North_Carolina_South_Carolina_Virginia_West_Virginia", 
+  "zip_code_3__Alabama_Florida_Georgia_Mississippi_Tennessee", 
+  "zip_code_4__Indiana_Kentucky_Michigan_Ohio", "zip_code_5__Iowa_Minnesota_Montana_North_Dakota_South_Dakota_Wisconsin", 
+  "zip_code_6__Illinois_Kansas_Missouri_Nebraska", "zip_code_7__Arkansas_Louisiana_Oklahoma_Texas", 
+  "zip_code_9__Alaska_California_Hawaii_Oregon_Washington", 
+  "bed_size_500", 
+  "bed_size_500999", 
+  "bed_size_Unknown"
+  )
+```
+
+```{r}
+#Create clones
+df.clones.non.pwud <- df.ccw %>% 
+  filter(pwud == "No") %>%
+  create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+  ) 
+
+#plot_censoring_over_time(df.clones.non.pwud)
+
+#Generate weights
+df.clones.non.pwud <- df.clones.non.pwud %>%
+  cast_clones_to_long() %>% 
+  generate_ccw(predvars = predvars_list_non_pwud) %>%
+  winsorize_ccw_weights(quantiles = c(0.01, 0.99))
+```
+
+```{r}
+
+#Cox model
+m.cox.non.pwud <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df.clones.non.pwud, weights = weight_cox)
+
+m.cox.non.pwud %>% tbl_regression(exponentiate = T)
+
+#Cox model
+m.cox.non.pwud.w <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df.clones.non.pwud.w, weights = weight_cox)
+                          
+m.cox.non.pwud.w %>% tbl_regression(exponentiate = T)
+
+# Kaplan-Meier estimate for each clone group using counting process data
+km_fit.ccw.non.pwud <- survfit(Surv(t_start, t_stop, outcome) ~ clone, 
+                  data = df.clones.non.pwud)
+
+# Plot Kaplan-Meier curve
+ggsurvplot(km_fit.ccw.non.pwud, 
+           data = df.clones.non.pwud, 
+           conf.int = FALSE,             # Do not show confidence intervals
+           pval = FALSE,                 # Do not show p-value
+           risk.table = FALSE,           # Do not show risk table
+           risk.table.col = "strata",    # Color by strata
+           ggtheme = theme_minimal(),    # Use minimal theme
+           legend.title = "Study arm",   # Legend title
+           legend.labs = c("SOC", "laLGP"),  # Legend labels
+           xlim = c(0, max(df.clones.pwud$t_stop)),  # Set x-axis limit (can adjust as needed)
+           break.time.by = 30,           # Set 30-day intervals for ticks
+           palette = jama_colors)  +       # Use JAMA color palette
+  labs(title = "non-PWUD - CCW analysis")
+
+#NAIVE
+# Kaplan-Meier estimate for each clone group using counting process data
+km_fit.naive.non.pwud <- survfit(Surv(composite_days, composite) ~ laLGP, 
+                  data = df.ccw %>% filter(pwud == "No"))
+
+# Plot Kaplan-Meier curve
+ggsurvplot(km_fit.naive.non.pwud, 
+           data = df.ccw %>% filter(pwud == "No"), 
+           conf.int = FALSE,             # Do not show confidence intervals
+           pval = FALSE,                 # Do not show p-value
+           risk.table = FALSE,           # Do not show risk table
+           risk.table.col = "strata",    # Color by strata
+           ggtheme = theme_minimal(),    # Use minimal theme
+           legend.title = "Study arm",   # Legend title
+           legend.labs = c("SOC", "laLGP"),  # Legend labels
+           xlim = c(0, max(df.clones.pwud$t_stop)),  # Set x-axis limit (can adjust as needed)
+           break.time.by = 30,           # Set 30-day intervals for ticks
+           palette = jama_colors) +       # Use JAMA color palette
+  labs(title = "non-PWUD - Naive analysis")
+```
+
+### Standradize weights
+
+```{r}
+df.clones.non.pwud.w <- df.clones.non.pwud %>%
+ winsorize_ccw_weights(quantiles = c(0.01, 0.99))
+
+#Cox model
+m.cox.non.pwud.w <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df.clones.non.pwud.w, weights = weight_cox)
+
+m.cox.non.pwud.w %>% tbl_regression(exponentiate = T)
+                          
+
+# Kaplan-Meier estimate for each clone group using counting process data
+km_fit.ccw.non.pwud.w <- survfit(Surv(t_start, t_stop, outcome) ~ clone, 
+                  data = df.clones.non.pwud.w)
+```
+
+```{r}
+# Fit IPCW-weighted logistic regression
+ipcw_model <- glm(composite ~ clone, weights = weight_cox, family = binomial, data = df.clones.non.pwud.w)
+
+tbl_regression(ipcw_model, exponentiate = T)
+
+```
+
+```{r}
+boot_cox <- function(data, indices) {
+  
+  # Make long data.frame with weights
+  ccw_df <- data[indices, ] |>
+    create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+    ) |>
+    cast_clones_to_long() |>
+    generate_ccw(predvars = predvars_list_non_pwud) |>
+    winsorize_ccw_weights(quantiles = c(0.01, 0.99))
+    
+  # Extract HR from CoxPH
+  cox_ccw <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = ccw_df, weights = weight_cox) 
+   
+  hr <- cox_ccw |>
+    coef() |>
+    exp()
+
+  out <- c("hr" = hr)
+
+  # Create survfit objects for each of treated and untreated
+  surv_1 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 1, ], weights = weight_cox)
+  surv_0 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 0, ], weights = weight_cox)
+
+  # RMST difference (Restricted Mean Survival Time over 90 days)
+  rmst_1 <- surv_1 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+  
+  rmst_0 <- surv_0 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+
+  rmst_diff <- rmst_1 - rmst_0
+
+  out <- c(out, "rmst_diff" = rmst_diff)
+
+  # 90-day survival difference
+  index_90d_1 <- which.min(abs(surv_1$time - 90))
+  index_90d_0 <- which.min(abs(surv_0$time - 90))
+
+  # Get the 90-day survival probabilities
+  surv_1_90d <- surv_1$surv[index_90d_1]
+  surv_0_90d <- surv_0$surv[index_90d_0]
+
+  surv_diff_90d <- surv_1_90d - surv_0_90d
+
+  out <- c(out, "surv_diff_90d" = surv_diff_90d)
+
+}
+```
+
+```{r}
+p_load(tictoc)
+tic()
+
+#Calculate CIs
+boot_out.non.pwud <- boot(data = df.ccw %>% filter(pwud == "No"), statistic = boot_cox, R = 500, parallel = "snow", ncpus=8)
+
+boot_out.non.pwud$t0
+
+boot.ci(boot_out.non.pwud, type = "norm", index = 1)
+
+```
+
+```{R}
+
+p_load(furrr)
+# Set up parallel plan with 10 workers
+plan(multisession, workers = 10)
+
+# Run bootstrapping with future_map_dfr in a safely wrapped function
+boot_out.non.pwud <- future_map_dfr(1:500, ~{
+  
+  safely_run <- safely(function() {
+    # Create a resample index
+    resample_index <- sample(nrow(df.ccw %>% filter(pwud == "No")), replace = TRUE)
+    
+    # Get the bootstrap sample
+    boot_sample <- df.ccw %>% filter(pwud == "No") %>% slice(resample_index)
+    
+    # Apply the boot_cox function
+    boot_cox(boot_sample)
+  })
+  
+  result <- safely_run()
+  
+  if (is.null(result$error)) {
+    return(result$result)
+  } else {
+    message("Error in iteration: ", result$error)
+    return(NULL)  # Ensures the function continues running even if an error occurs
+  }
+}, .progress = TRUE, .options = furrr_options(seed = 1))
+
+# Return to sequential plan (optional)
+plan(sequential)
+
+# Extract mean and 95% CI for HR and RMST
+boot_results_non_pwud <- boot_out.non.pwud %>%
+  summarise(
+    hr_mean = mean(hr.clone),
+    hr_lower = quantile(hr.clone, 0.025),
+    hr_upper = quantile(hr.clone, 0.975),
+    rmst_mean = mean(rmst_diff.rmean),
+    rmst_lower = quantile(rmst_diff.rmean, 0.025),
+    rmst_upper = quantile(rmst_diff.rmean, 0.975)
+  )
+
+boot_results_non_pwud 
+
+# Create gt table
+final_table <- boot_results_non_pwud %>%
+  mutate(
+    `HR (95% CI)` = paste0(round(hr_mean, 2), 
+                           " (", round(hr_lower, 2), " - ", round(hr_upper, 2), ")"),
+    `RMST Diff 90d (95% CI)` = paste0(round(rmst_mean, 2), 
+                                      " (", round(rmst_lower, 2), " - ", round(rmst_upper, 2), ")")
+  ) %>%
+  select(`HR (95% CI)`, `RMST Diff 90d (95% CI)`) %>%
+  gt() %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes in Non-PWUD") 
+
+final_table
+
+# Save as Word document
+gtsave(final_table, "laLGP_Effect_NonPWUD_windsorize.docx")
+```

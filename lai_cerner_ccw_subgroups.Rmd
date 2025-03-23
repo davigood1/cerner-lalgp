@@ -1,0 +1,253 @@
+```{r}
+p_load(tidyverse, tidylog, survival, survminer, boot, RColorBrewer, gtsummary, gt)
+
+# Define JAMA colors
+jama_colors <- brewer.pal(2, "Set1")
+```
+
+```{r}
+# Define subgroups for analysis
+subgroups <- c("Bacteremia", "Endocarditis", "Osteomyelitis", "separthritis" )
+
+
+# Define list of predictor variables
+predvars_list_pwud <- c(
+  "age", "alcohol", "bloss", 
+  "pud", "copd", "coag", "chf", "anem", "dep", "diabeteswcomp", 
+  "diabeteswocopm", "fluid", "hiv", "hypert", "hypertun", "hypothy", 
+  "liver", "lymph", "cancmeta", "obe", "neuro", "para", "pvd", 
+  "psycho", "pcd", "rf", "collavd", "cancwometa", "valve", "weight", 
+  "oud", "cud", "mud", "idu",
+  "gender_Female", "race_Black_or_African_American", 
+  "race_Other_race", "race_Unknown", "ethnicity_Hispanic_or_Latino", 
+  "ethnicity_Unknown", "insurance_Commerical_insurance", "insurance_Medicaid", 
+  "insurance_Other", "insurance_Unknown",
+  "bed_size_500", "bed_size_500999",
+"zip_code_0__Connecticut_Massachusetts_Maine_New_Hampshire_New_Jersey_Puerto_Rico_Rhode_Island", 
+"zip_code_1__Delaware_New_York_Pennsylvania", "zip_code_2__District_of_Columbia_Maryland_North_Carolina_South_Carolina_Virginia_West_Virginia", 
+"zip_code_3__Alabama_Florida_Georgia_Mississippi_Tennessee", 
+"zip_code_4__Indiana_Kentucky_Michigan_Ohio", "zip_code_5__Iowa_Minnesota_Montana_North_Dakota_South_Dakota_Wisconsin", 
+"zip_code_6__Illinois_Kansas_Missouri_Nebraska", "zip_code_7__Arkansas_Louisiana_Oklahoma_Texas", 
+"zip_code_9__Alaska_California_Hawaii_Oregon_Washington"
+)
+```
+
+```{r}
+# Function to create clones, compute weights, run Cox model, and generate Kaplan-Meier plot
+analyze_subgroup <- function(subgroup) {
+  message("Analyzing subgroup: ", subgroup)
+  
+  # Subset data for the subgroup
+  df_subgroup <- df.ccw %>% 
+    filter(pwud == "Yes", !!sym(subgroup) == 1) %>%  # Filter by subgroup presence
+    create_clones(
+      id = 'id',
+      event = 'composite',
+      time_to_event = 'composite_days',
+      exposure = 'laLGP',
+      time_to_exposure = 'glyco_days',
+      ced_window = 10
+    ) 
+  
+  # Generate weights
+  df_clones <- df_subgroup %>%
+    cast_clones_to_long() %>% 
+    generate_ccw(predvars = predvars_list_pwud)
+  
+  # Cox model
+  m_cox <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df_clones, weights = weight_cox)
+  
+  # Kaplan-Meier fit
+  km_fit <- survfit(Surv(t_start, t_stop, outcome) ~ clone, data = df_clones)
+  
+  # Plot Kaplan-Meier curve
+  p <- ggsurvplot(
+    km_fit, 
+    data = df_clones, 
+    conf.int = FALSE,           
+    pval = FALSE,               
+    risk.table = FALSE,         
+    risk.table.col = "strata",    
+    ggtheme = theme_minimal(),   
+    legend.title = "Study arm",   
+    legend.labs = c("SOC", "laLGP"),  
+    xlim = c(0, max(df_clones$t_stop)),  
+    break.time.by = 30,           
+    palette = jama_colors
+  ) + labs(title = paste("PWUD - CCW analysis (", subgroup, ")"))
+  
+  return(list(subgroup = subgroup, cox_model = m_cox, km_plot = p))
+}
+```
+
+```{r}
+# Apply function to each subgroup and store results
+results <- map(subgroups, analyze_subgroup)
+
+results
+
+# Extract plots and display them
+plots <- map(results, "km_plot")
+plots
+```
+
+```{r}
+boot_cox <- function(data, indices) {
+  
+  # Make long data.frame with weights
+  ccw_df <- data[indices, ] |>
+    create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+    ) |>
+    cast_clones_to_long() |>
+  generate_ccw(predvars = predvars_list_pwud)
+    
+  # Extract HR from CoxPH
+  cox_ccw <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = ccw_df, weights = weight_cox) 
+   
+  hr <- cox_ccw |>
+    coef() |>
+    exp()
+
+  out <- c("hr" = hr)
+
+  # Create survfit objects for each of treated and untreated
+  surv_1 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 1, ], weights = weight_cox)
+  surv_0 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 0, ], weights = weight_cox)
+
+  # RMST difference (Restricted Mean Survival Time over 90 days)
+  rmst_1 <- surv_1 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+  
+  rmst_0 <- surv_0 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+
+  rmst_diff <- rmst_1 - rmst_0
+
+  out <- c(out, "rmst_diff" = rmst_diff)
+
+  # 90-day survival difference
+  index_90d_1 <- which.min(abs(surv_1$time - 90))
+  index_90d_0 <- which.min(abs(surv_0$time - 90))
+
+  # Get the 90-day survival probabilities
+  surv_1_90d <- surv_1$surv[index_90d_1]
+  surv_0_90d <- surv_0$surv[index_90d_0]
+
+  surv_diff_90d <- surv_1_90d - surv_0_90d
+
+  out <- c(out, "surv_diff_90d" = surv_diff_90d)
+
+}
+```
+
+```{r}
+boot_results <- map(subgroups, ~{
+  boot(data = df.ccw %>% filter(pwud == "Yes", !!sym(.x) == 1), 
+       statistic = boot_cox, 
+        R = 500, parallel = "multicore", ncpus=parallel::detectCores())  
+})
+
+# Extract CI results
+boot_cis <- map(boot_results, ~ boot.ci(.x, type = "norm", index = 1))
+
+names(boot_results) <- subgroups
+names(boot_cis) <- subgroups
+
+results$Endocarditis$model 
+results$Endocarditis$plot 
+boot_results$Endocarditis 
+boot_cis$Endocarditis 
+
+
+```
+
+```{r}
+# Function to extract HR, CI, RMST difference
+extract_results <- function(subgroup, boot_res, boot_ci) {
+  
+  # Extract HR
+  hr <- boot_res$t0[1]
+  
+  # Extract confidence intervals
+  hr_lower <- boot_ci$normal[2]
+  hr_upper <- boot_ci$normal[3]
+  
+  # Extract RMST difference
+  rmst_diff <- boot_res$t0[2]
+  
+  # Extract confidence intervals for RMST
+  rmst_ci <- boot.ci(boot_res, type = "norm", index = 2)
+  rmst_lower <- rmst_ci$normal[2]
+  rmst_upper <- rmst_ci$normal[3]
+
+  tibble(
+    Subgroup = subgroup,
+    HR = hr,
+    `95% CI (HR)` = sprintf("%.2f (%.2f - %.2f)", hr, hr_lower, hr_upper),
+    RMST_Diff_90d = rmst_diff,
+    `95% CI (RMST)` = sprintf("%.2f (%.2f - %.2f)", rmst_diff, rmst_lower, rmst_upper)
+  )
+}
+```
+
+```{r}
+# Create a results table
+results_table_subgroups <- map2_dfr(names(boot_results), boot_results, ~{
+  extract_results(.x, .y, boot_cis[[.x]])
+})
+
+# Print table using gt
+gt(results_table_subgroups) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes by Infection Subgroup") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 2)
+
+```
+
+```{r}
+antibiotics <- c("Vancomycin", "Cefazolin")
+boot_results_antibiotics <- map(antibiotics, ~{
+  boot(data = df.ccw %>% filter(pwud == "Yes", antibiotics == .x | laLGP == 1), 
+       statistic = boot_cox, 
+        R = 500, parallel = "multicore", ncpus=parallel::detectCores())  
+})
+
+# Extract CI results
+boot_cis_antibiotics <- map(boot_results_antibiotics, ~ boot.ci(.x, type = "norm", index = 1))
+
+names(boot_results_antibiotics) <- antibiotics
+names(boot_cis_antibiotics) <- antibiotics
+
+# Create a results table
+results_table_antibiotics <- map2_dfr(names(boot_results_antibiotics), boot_results_antibiotics, ~{
+  extract_results(.x, .y, boot_cis_antibiotics[[.x]])
+})
+
+# Print table using gt
+gt(results_table_antibiotics) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes by Infection Subgroup") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 2)
+
+```
+```

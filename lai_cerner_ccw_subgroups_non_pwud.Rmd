@@ -1,0 +1,296 @@
+```{r}
+p_load(tidyverse, tidylog, survival, survminer, boot, RColorBrewer, gtsummary, gt)
+
+# Define JAMA colors
+jama_colors <- brewer.pal(2, "Set1")
+```
+
+```{r}
+# Define subgroups for analysis
+subgroups <- c("Bacteremia", "Endocarditis", "Osteomyelitis", "separthritis" )
+
+
+# Define list of predictor variables
+predvars_list_non_pwud <- c(
+  "age", 
+  "gender_Female", 
+  "race_Black_or_African_American", 
+  "race_Other_race", 
+  "ethnicity_Hispanic_or_Latino",
+  "ethnicity_Unknown",
+  "insurance_Commerical_insurance", 
+  "insurance_Medicaid", 
+  "insurance_Other", 
+  "insurance_Unknown", 
+  "alcohol", "bloss", "pud", "copd", "coag", "chf", "anem", "dep", 
+  "diabeteswcomp", "diabeteswocopm", "fluid", "hiv", "hypert", "hypertun", 
+  "hypothy", "liver", "lymph", "cancmeta", "obe", "neuro", "para", "pvd", 
+  "psycho", "pcd", "rf", "collavd", "cancwometa", "valve", "weight", 
+  "zip_code_0__Connecticut_Massachusetts_Maine_New_Hampshire_New_Jersey_Puerto_Rico_Rhode_Island", 
+  "zip_code_1__Delaware_New_York_Pennsylvania", "zip_code_2__District_of_Columbia_Maryland_North_Carolina_South_Carolina_Virginia_West_Virginia", 
+  "zip_code_3__Alabama_Florida_Georgia_Mississippi_Tennessee", 
+  "zip_code_4__Indiana_Kentucky_Michigan_Ohio", "zip_code_5__Iowa_Minnesota_Montana_North_Dakota_South_Dakota_Wisconsin", 
+  "zip_code_6__Illinois_Kansas_Missouri_Nebraska", "zip_code_7__Arkansas_Louisiana_Oklahoma_Texas", 
+  "zip_code_9__Alaska_California_Hawaii_Oregon_Washington", 
+  "bed_size_500", 
+  "bed_size_500999", 
+  "bed_size_Unknown"
+  )
+```
+
+```{r}
+# Function to create clones, compute weights, run Cox model, and generate Kaplan-Meier plot
+analyze_subgroup <- function(subgroup) {
+  message("Analyzing subgroup: ", subgroup)
+  
+  # Subset data for the subgroup
+  df_subgroup <- df.ccw %>% 
+    filter(pwud == "No", !!sym(subgroup) == 1) %>%  # Filter by subgroup presence
+    create_clones(
+      id = 'id',
+      event = 'composite',
+      time_to_event = 'composite_days',
+      exposure = 'laLGP',
+      time_to_exposure = 'glyco_days',
+      ced_window = 10
+    ) 
+  
+  # Generate weights
+  df_clones <- df_subgroup %>%
+    cast_clones_to_long() %>% 
+    generate_ccw(predvars = predvars_list_non_pwud)
+  
+  # Cox model
+  m_cox <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = df_clones, weights = weight_cox)
+  
+  # Kaplan-Meier fit
+  km_fit <- survfit(Surv(t_start, t_stop, outcome) ~ clone, data = df_clones)
+  
+  # Plot Kaplan-Meier curve
+  p <- ggsurvplot(
+    km_fit, 
+    data = df_clones, 
+    conf.int = FALSE,           
+    pval = FALSE,               
+    risk.table = FALSE,         
+    risk.table.col = "strata",    
+    ggtheme = theme_minimal(),   
+    legend.title = "Study arm",   
+    legend.labs = c("SOC", "laLGP"),  
+    xlim = c(0, max(df_clones$t_stop)),  
+    break.time.by = 30,           
+    palette = jama_colors
+  ) + labs(title = paste("non-PWUD - CCW analysis (", subgroup, ")"))
+  
+  return(list(subgroup = subgroup, cox_model = m_cox, km_plot = p))
+}
+```
+
+```{r}
+# Apply function to each subgroup and store results
+results <- map(subgroups, analyze_subgroup)
+
+results
+
+# Extract plots and display them
+plots <- map(results, "km_plot")
+plots
+```
+
+```{r}
+boot_cox <- function(data, indices) {
+  
+  # Make long data.frame with weights
+  ccw_df <- data[indices, ] |>
+    create_clones(
+    id = 'id',
+    event = 'composite',
+    time_to_event = 'composite_days',
+    exposure = 'laLGP',
+    time_to_exposure = 'glyco_days',
+    ced_window = 10
+    ) |>
+    cast_clones_to_long() |>
+  generate_ccw(predvars = predvars_list_non_pwud) %>%
+  winsorize_ccw_weights(quantiles = c(0.01, 0.99))
+    
+  # Extract HR from CoxPH
+  cox_ccw <- coxph(Surv(t_start, t_stop, outcome) ~ clone, data = ccw_df, weights = weight_cox) 
+   
+  hr <- cox_ccw |>
+    coef() |>
+    exp()
+
+  out <- c("hr" = hr)
+
+  # Create survfit objects for each of treated and untreated
+  surv_1 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 1, ], weights = weight_cox)
+  surv_0 <- survfit(Surv(t_start, t_stop, outcome) ~ 1L, data = ccw_df[ccw_df$clone == 0, ], weights = weight_cox)
+
+  # RMST difference (Restricted Mean Survival Time over 90 days)
+  rmst_1 <- surv_1 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+  
+  rmst_0 <- surv_0 |>
+    summary(rmean = 90) |>  # Adjusted to 90-day RMST
+    (\(summary) summary$table)() |>
+    (\(table) table["rmean"])()
+
+  rmst_diff <- rmst_1 - rmst_0
+
+  out <- c(out, "rmst_diff" = rmst_diff)
+
+  # 90-day survival difference
+  index_90d_1 <- which.min(abs(surv_1$time - 90))
+  index_90d_0 <- which.min(abs(surv_0$time - 90))
+
+  # Get the 90-day survival probabilities
+  surv_1_90d <- surv_1$surv[index_90d_1]
+  surv_0_90d <- surv_0$surv[index_90d_0]
+
+  surv_diff_90d <- surv_1_90d - surv_0_90d
+
+  out <- c(out, "surv_diff_90d" = surv_diff_90d)
+
+}
+```
+
+```{r}
+# Make sure 'subgroups' is a character vector of column names
+subgroups <- as.character(subgroups)
+
+subgroups <- c("Bacteremia", "Endocarditis", "Osteomyelitis", "separthritis")
+  
+#), "Endocarditis", "Osteomyelitis", "separthritis" )
+
+
+# Set up parallel plan with 10 workers
+plan(multisession, workers = 10)
+
+
+# Run boot_cox in parallel for each subgroup without boot(), wrapped in safely()
+boot_results_subgroups <- future_map(subgroups, ~{
+  subgroup_name <- .x  # Capture the subgroup name
+  future_map_dfr(1:500, ~{
+    safely_run <- safely(function() {
+      resample_index <- sample(nrow(
+        df.ccw %>% 
+          filter(pwud == "No", !!sym(subgroup_name) == 1)), 
+        replace = TRUE)
+      boot_sample <- df.ccw %>% 
+        filter(pwud == "No", !!sym(subgroup_name) == 1) %>% 
+        slice(resample_index)
+      boot_cox(boot_sample)
+    })
+    
+    result <- safely_run()
+    if (is.null(result$error)) {
+      return(result$result)
+    } else {
+      message("Error in iteration: ", result$error)
+      return(NULL)
+    }
+  }, .progress = TRUE, .options = furrr_options(seed = 1))
+}, .progress = TRUE, .options = furrr_options(seed = 1))
+
+names(boot_results_subgroups) <- subgroups
+
+# Create a results table
+results_table_subgroups <- map2_dfr(names(boot_results_subgroups), boot_results_subgroups, ~{
+  extract_results(.x, .y)
+})
+
+# Print table using gt
+gt(results_table_subgroups) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes by Subgroup") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 2)
+
+# Return to sequential plan (optional)
+plan(sequential)
+
+```
+
+
+
+
+```{r}
+df.ccw %>% filter(pwud == "No", antibiotics == "Vancomycin" | laLGP == 1)
+
+# Set up parallel plan with 10 workers
+plan(multisession, workers = 10)
+
+# Define antibiotics of interest
+antibiotics <- c("Vancomycin", "Cefazolin")
+
+# Run boot_cox in parallel for each antibiotic without boot()
+boot_results_antibiotics <- future_map(antibiotics, ~{
+  antibiotic_name <- .x  # Capture the antibiotic name
+  future_map_dfr(1:500, ~{
+    resample_index <- sample(nrow(
+      df.ccw %>% 
+        filter(pwud == "No", antibiotics == antibiotic_name | laLGP == 1)), 
+      replace = TRUE)
+    boot_sample <- df.ccw %>% 
+      filter(pwud == "No", antibiotics == antibiotic_name | laLGP == 1) %>% 
+      slice(resample_index)
+    boot_cox(boot_sample)
+  }, .progress = TRUE, .options = furrr_options(seed = 1))
+}, .progress = TRUE, .options = furrr_options(seed = 1))
+
+names(boot_results_antibiotics) <- antibiotics
+
+# Create a results table
+results_table_antibiotics <- map2_dfr(names(boot_results_antibiotics), boot_results_antibiotics, ~{
+  extract_results(.x, .y)
+})
+
+# Print table using gt
+gt(results_table_antibiotics) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes by Antibiotic") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 2)
+
+# Return to sequential plan (optional)
+plan(sequential)
+
+
+```
+
+```{r}
+# Merge both tables
+results_table_combined <- bind_rows(
+  results_table_subgroups %>% mutate(analysis = "Subgroup"),
+  results_table_antibiotics %>% mutate(analysis = "Antibiotic")
+) %>%
+  mutate(across(is.numeric, ~round(.,3)))
+
+# Print table using gt
+final_table <- gt(results_table_combined) %>%
+  tab_header(title = "Effect of laLGP on Composite Outcomes") %>%
+  cols_label(
+    HR = "Hazard Ratio",
+    `95% CI (HR)` = "95% Confidence Interval (HR)",
+    RMST_Diff_90d = "90-day RMST Difference",
+    `95% CI (RMST)` = "95% Confidence Interval (RMST)",
+    Group = "Analysis Group"
+  ) %>%
+  fmt_number(columns = c(HR, RMST_Diff_90d), decimals = 3)
+
+final_table 
+
+# Save the table as a Word document
+gtsave(final_table, "laLGP_Effect_Results_non_pwud_subgroups_standradized.docx")
+```
